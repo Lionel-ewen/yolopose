@@ -318,6 +318,7 @@ def main() -> int:
     freqs: list[float] = []
     detected_frames = 0
     loop_count = 0
+    timing_fallback_frames = 0
 
     render_enabled = args.render or args.plot_only
     window_name = f"benchmark::{args.tag}"
@@ -367,6 +368,17 @@ def main() -> int:
             inf_ms = float(speed.get("inference", 0.0) or 0.0)
             post_ms = float(speed.get("postprocess", 0.0) or 0.0)
 
+            # 部分后端（如 NCNN）可能不填充内建三段计时，导致推理耗时记为 0、
+            # 耗时分解失真。此时回退为 predict() 调用的墙钟时间。
+            # 注意：端到端 FPS 由 tot_ms 独立计算，不受此回退影响。
+            fallback_used = False
+            if inf_ms <= 0.0:
+                wall_predict_ms = (m2 - m1) * 1000.0
+                residual = wall_predict_ms - pre_ms - post_ms
+                inf_ms = residual if residual > 0 else wall_predict_ms
+                fallback_used = True
+                timing_fallback_frames += 1
+
             cap_ms = (m1 - m0) * 1000.0
             ana_ms = (m3 - m2) * 1000.0
             ren_ms = (m4 - m3) * 1000.0
@@ -415,6 +427,7 @@ def main() -> int:
                         "people": people_count,
                         "temp_c": "" if temp_c is None else round(temp_c, 1),
                         "freq_mhz": "" if freq_mhz is None else round(freq_mhz, 0),
+                        "timing_fallback": int(fallback_used),
                     }
                 )
 
@@ -482,6 +495,7 @@ def main() -> int:
             "frames": len(t_total),
             "wall_seconds": round(wall_seconds, 3),
             "detect_rate": round(detected_frames / len(t_total), 4),
+            "timing_fallback_frames": timing_fallback_frames,
         },
         "stages_ms": stages,
         "fps": {
@@ -599,6 +613,11 @@ def main() -> int:
         print(f"  温度            : {temps[0]:.1f}C -> {temps[-1]:.1f}C  峰值 {max(temps):.1f}C")
     if freqs:
         print(f"  CPU 频率        : {min(freqs):.0f} - {max(freqs):.0f} MHz")
+    if timing_fallback_frames:
+        print(
+            f"  [!] 分项计时回退 : {timing_fallback_frames} 帧未提供内建计时，"
+            f"推理耗时改用 predict() 墙钟时间（端到端 FPS 不受影响）"
+        )
     if throttled_end and throttled_end != "0x0":
         print(f"  [!] 降频标志    : {throttled_end}  <- 发生过降频，本次数据需在报告中标注")
     print("=" * 68)

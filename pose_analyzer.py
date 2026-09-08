@@ -254,9 +254,16 @@ def draw_analysis_overlay(frame, analysis: PoseAnalysis, origin: tuple[int, int]
     height = 18 + line_height * len(lines)
     x, y = origin
 
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x, y), (x + width, y + height), (20, 20, 20), thickness=-1)
-    cv2.addWeighted(overlay, 0.62, frame, 0.38, 0, frame)
+    frame_height, frame_width = frame.shape[:2]
+    x1 = min(max(x, 0), frame_width)
+    y1 = min(max(y, 0), frame_height)
+    x2 = min(x + width, frame_width)
+    y2 = min(y + height, frame_height)
+    if x2 > x1 and y2 > y1:
+        roi = frame[y1:y2, x1:x2]
+        panel = roi.copy()
+        cv2.rectangle(panel, (0, 0), (x2 - x1, y2 - y1), (20, 20, 20), thickness=-1)
+        cv2.addWeighted(panel, 0.62, roi, 0.38, 0, roi)
 
     for index, line in enumerate(lines):
         cv2.putText(
