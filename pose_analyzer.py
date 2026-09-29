@@ -131,6 +131,7 @@ class PoseAnalyzer:
         self.squat_up_angle = squat_up_angle
         self.squat_count = 0
         self.squat_phase = "unknown"
+        self._counted_this_cycle = True  # 本轮站起是否已计数（去抖/缺帧容忍）
 
     def analyze(self, keypoints: list[Keypoint], primary_person_index: int | None) -> PoseAnalysis:
         if not keypoints:
@@ -186,14 +187,20 @@ class PoseAnalyzer:
         if knee_angles:
             avg_knee_angle = sum(knee_angles) / len(knee_angles)
             if avg_knee_angle < self.squat_down_angle:
-                self.squat_phase = "down"
+                # 下降边沿（仅从 up/unknown 转入 down 时触发一次，蹲底停顿不重复）
+                if self.squat_phase in ("up", "unknown"):
+                    self.squat_phase = "down"
+                    self._counted_this_cycle = False
                 actions.append("Squat down")
             elif avg_knee_angle > self.squat_up_angle:
-                if self.squat_phase == "down":
+                # 上升边沿：完成一次有效蹲起配对，本轮只计一次
+                if self.squat_phase == "down" and not self._counted_this_cycle:
                     self.squat_count += 1
+                    self._counted_this_cycle = True
                 self.squat_phase = "up"
                 actions.append("Standing")
             else:
+                # 过渡区：保持 squat_phase 不变（缺帧容忍，不重置本轮状态）
                 actions.append("Squat transition")
 
         torso_lean = angles.get("torso_lean")
@@ -231,6 +238,12 @@ class PoseAnalyzer:
         if point.conf < self.min_conf or point.x <= 0 or point.y <= 0:
             return None
         return point
+
+    def finalize(self) -> None:
+        """视频结束收尾：若最后一轮下蹲后站起帧缺失，补计一次。"""
+        if self.squat_phase == "down" and not self._counted_this_cycle:
+            self.squat_count += 1
+            self._counted_this_cycle = True
 
 
 def angle_degrees(a: Keypoint, b: Keypoint, c: Keypoint) -> float:
