@@ -122,9 +122,9 @@ class PoseAnalyzer:
 
     def __init__(
         self,
-        min_conf: float = 0.25,
+        min_conf: float = 0.05,
         squat_down_angle: float = 105.0,
-        squat_up_angle: float = 160.0,
+        squat_up_angle: float = 150.0,
     ) -> None:
         self.min_conf = min_conf
         self.squat_down_angle = squat_down_angle
