@@ -261,7 +261,7 @@ def probe_device_summary(args: argparse.Namespace, fourcc: str | None = None) ->
     frames = 0
 
     try:
-        while frames < args.probe_frames:
+        while args.probe_frames == 0 or frames < args.probe_frames:
             if args.duration > 0 and (time.perf_counter() - started) >= args.duration:
                 break
             t0 = time.perf_counter()
@@ -343,7 +343,7 @@ def run_e2e(args: argparse.Namespace) -> dict:
     detect_hits = 0
 
     try:
-        while frames < args.frames:
+        while args.frames == 0 or frames < args.frames:
             if args.duration > 0 and (time.perf_counter() - started) >= args.duration:
                 break
 
@@ -569,6 +569,17 @@ def dump_trace(results_dir: Path, tag: str, samples: list[dict]) -> Path | None:
 
 def main() -> int:
     args = parse_args()
+
+    # --frames 0 / --probe-frames 0 表示「不按帧数停止」，只按时长停。
+    # 两者都为 0 会变成无限循环，所以这里兜回默认值并提示。
+    if args.duration <= 0:
+        if args.probe_frames == 0:
+            print("⚠️ --probe-frames 0 需要配合 --duration 使用，已回退为 300 帧。")
+            args.probe_frames = 300
+        if args.frames == 0:
+            print("⚠️ --frames 0 需要配合 --duration 使用，已回退为 300 帧。")
+            args.frames = 300
+
     results_dir = Path(args.results_dir)
     csv_path = results_dir / "camera_probe_results.csv"
     device = detect_device_name()
