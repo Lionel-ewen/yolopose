@@ -115,6 +115,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=480, help="摄像头采集高度。")
     parser.add_argument("--fourcc", default="MJPG", help="摄像头像素格式。")
 
+    parser.add_argument("--duration", type=float, default=0.0,
+                        help="测量时长（秒），0 表示不限。真人摄像头实验用它按时停，"
+                             "比按帧数估算可控（40 FPS 下 60 s≈2400 帧，算错就白跑）。")
+    parser.add_argument("--countdown", type=float, default=3.0,
+                        help="开始前倒计时秒数，仅摄像头模式生效：给被摄者站位时间，"
+                             "同时让相机 AE/AWB 收敛。倒计时期间只读帧不推理，不计入统计。")
+    parser.add_argument("--no-countdown-preview", dest="countdown_preview",
+                        action="store_false", default=True,
+                        help="倒计时不弹预览窗口（纯 SSH 无显示环境用）。"
+                             "注意预览只在倒计时阶段开，进入测量前必定关闭 —— "
+                             "测量期开窗会把推理拖慢 2 倍以上（P4-c / P8 结论）。")
+
     parser.add_argument("--tag", default="online_untagged", help="实验标签。")
     parser.add_argument("--notes", default="", help="备注。")
     parser.add_argument("--results-dir", default="results", help="结果输出目录。")
@@ -142,11 +154,59 @@ def open_source(args: argparse.Namespace):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        reported = cap.get(cv2.CAP_PROP_FPS)
+        print(f"相机自报 {reported:.1f} FPS —— 本项目实测该项虚标"
+              f"（MJPG@640 自报 120.1 / 实测 51.18），帧率一律以结尾 fps_e2e 为准。")
         return cap, "camera", 0.0
 
     cap = cv2.VideoCapture(args.source)
     fps_hint = cap.get(cv2.CAP_PROP_FPS) or 0.0
     return cap, "video", fps_hint
+
+
+def run_countdown(cap, args: argparse.Namespace) -> bool:
+    """倒计时期间只读帧不推理：给被摄者站位，同时让相机 AE/AWB 收敛。
+
+    返回 False 表示中途读帧失败。文件模式直接返回 True（无意义）。
+    预览窗口只在倒计时阶段存在，进入测量前必须销毁 —— imshow/waitKey 会抢
+    CPU 与内存带宽，把推理从 19.8 ms 拖到 63.6 ms（P4-c 实测），窗口一开实时就没了。
+    """
+    if args.countdown <= 0 or not is_camera_source(args.source):
+        return True
+
+    print(f"倒计时 {args.countdown:g} s，请站到地面标记处并保持站立姿态...")
+    deadline = time.perf_counter() + args.countdown
+    shown = False
+
+    while True:
+        remain = deadline - time.perf_counter()
+        if remain <= 0:
+            break
+        ok, frame = cap.read()
+        if not ok:
+            print("[ERROR] 倒计时期间读帧失败。")
+            return False
+        if args.countdown_preview:
+            try:
+                canvas = frame.copy()
+                label = f"{remain:0.1f}s"
+                cv2.putText(canvas, label, (24, 72), cv2.FONT_HERSHEY_SIMPLEX,
+                            1.8, (0, 0, 0), 6, cv2.LINE_AA)
+                cv2.putText(canvas, label, (24, 72), cv2.FONT_HERSHEY_SIMPLEX,
+                            1.8, (80, 255, 120), 2, cv2.LINE_AA)
+                cv2.imshow("Pose count - countdown", canvas)
+                cv2.waitKey(1)
+                shown = True
+            except cv2.error:
+                # 无显示环境（SSH / 无 Wayland socket）静默降级为终端倒计时
+                args.countdown_preview = False
+
+    if shown:
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
+
+    print("开始计数。")
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -177,6 +237,11 @@ def main() -> int:
     print(f"阈值: down<{args.down}° / up>{args.up}°   min_kpt_conf={args.min_kpt_conf}")
     print("=" * 66)
 
+    # 倒计时只在摄像头模式生效，放在预热之前：顺带把相机缓冲读空，避免陈帧入账
+    if not run_countdown(cap, args):
+        cap.release()
+        return 1
+
     # 预热：让 ncnn/ultralytics 完成图构建，否则首帧开销会污染计时
     for _ in range(max(0, args.warmup)):
         ok, frame = cap.read()
@@ -195,6 +260,9 @@ def main() -> int:
     try:
         while True:
             if args.max_frames and frames >= args.max_frames:
+                break
+            if args.duration > 0 and (time.perf_counter() - started) >= args.duration:
+                print(f"到达设定时长 {args.duration:g} s，停止采集。")
                 break
 
             t0 = time.perf_counter()
