@@ -54,12 +54,77 @@ from __future__ import annotations
 
 import argparse
 import csv
+import signal
 import statistics
 import time
 from datetime import datetime
 from pathlib import Path
 
 import cv2
+
+
+# --------------------------------------------------------------------------
+# 优雅停止：SIGTERM / Ctrl+C 都必须走「先落盘、再退出」这条路
+# --------------------------------------------------------------------------
+# 教训（2026-11-07）：落盘代码位于 try/finally 之外，而 finally 只做了
+# cap.release()。Ctrl+C 抛出的 KeyboardInterrupt 在 finally 之后继续向上传播，
+# 会把整段落盘直接跳过 —— 真人实验跑了十分钟，按一次 Ctrl+C 帧数、计数、events、
+# trace、汇总行一条都不会写。本模块把 SIGTERM 也接进同一条路径，
+# 方便以后接 GPIO 按钮或 systemd 停止服务。
+
+_STOP = {"reason": ""}
+
+
+def request_stop(reason: str) -> None:
+    """记录第一个停止原因，后续请求不覆盖（保留最早的那次，便于归因）。"""
+    if not _STOP["reason"]:
+        _STOP["reason"] = reason
+
+
+def stop_reason() -> str:
+    return _STOP["reason"]
+
+
+def _handle_sigterm(signum, frame) -> None:
+    # signal handler 里只置标志、不抛异常：在 cv2 的 C 扩展内部抛异常不安全
+    request_stop("SIGTERM")
+
+
+def install_signal_handlers() -> None:
+    try:
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+    except (AttributeError, OSError, ValueError):
+        # 非主线程、或平台不支持 SIGTERM 时退化为只支持 Ctrl+C
+        pass
+
+
+def block_signals_during_cleanup() -> dict:
+    """清理阶段屏蔽 SIGINT/SIGTERM，返回原 handler 供恢复。
+
+    这是「明明按了停止却什么都没保存」的第二个成因（第一个是异常冒泡）。
+    落盘代码在 try/finally 之后，而 finally 里要做 cap.release() ——
+    UVC 相机上这是几十到上百毫秒的慢操作，用户在这个窗口里必然会再按一次 Ctrl+C。
+    第二个 KeyboardInterrupt 从 finally 冒出去，后面那一整段落盘一行都不会执行。
+    """
+    previous: dict = {}
+    for name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            previous[name] = signal.getsignal(sig)
+            signal.signal(sig, signal.SIG_IGN)
+        except (OSError, ValueError):
+            pass
+    return previous
+
+
+def compose_notes(base: str) -> str:
+    """把中断原因写进 notes，落盘的每一行都能追溯是不是被打断的。"""
+    reason = stop_reason()
+    if not reason:
+        return base
+    return f"{base} [interrupted:{reason}]".strip()
 
 from pose_analyzer import PoseAnalyzer, extract_primary_keypoints
 
@@ -216,6 +281,7 @@ def run_countdown(cap, args: argparse.Namespace) -> bool:
 
 def main() -> int:
     args = parse_args()
+    install_signal_handlers()
     from ultralytics import YOLO
 
     results_dir = Path(args.results_dir)
@@ -259,6 +325,9 @@ def main() -> int:
 
     try:
         while True:
+            if stop_reason():
+                print(f"\n[停止] 收到 {stop_reason()}，正在保存已采集的 {frames} 帧...")
+                break
             if args.max_frames and frames >= args.max_frames:
                 break
             if args.duration > 0 and (time.perf_counter() - started) >= args.duration:
@@ -310,9 +379,22 @@ def main() -> int:
                 "count_online": analysis.squat_count,
                 "actions": ";".join(analysis.actions),
             })
+    except KeyboardInterrupt:
+        request_stop("Ctrl+C")
+        print(f"\n[停止] 收到 Ctrl+C —— 已采集 {frames} 帧，正在保存，"
+              "请等这一行打印完再松手（不要连按、不要 force kill）...")
     finally:
+        # 二次 Ctrl+C 会正好打在 cap.release() 里，把下面整段计数汇总与落盘跳过。
+        # 这里刻意**不恢复**信号：从 release 到汇总行写完还剩几十毫秒，
+        # 屏蔽到进程退出才真的做到「按了就一定存下来」。
+        block_signals_during_cleanup()
         wall = time.perf_counter() - started
         cap.release()
+
+    # 倒计时/预热阶段就被打断时 frames 为 0，此时不该往结果表里塞空行
+    if frames == 0:
+        print("[WARN] 未采集到任何帧，不写任何结果文件。")
+        return 1
 
     # ---- 关键对比：在线口径（不调 finalize）vs 离线口径（调 finalize）----
     online_count = analyzer.squat_count
@@ -335,6 +417,11 @@ def main() -> int:
     print(f"【在线口径】  {online_count} 次（不调 finalize，真实设备行为）")
     print(f"【离线口径】  {offline_count} 次（调 finalize，现有 count_squats.py 行为）")
     print(f"【收尾补计】  {finalize_delta} 次")
+
+    if stop_reason():
+        print("")
+        print(f"⚠️ 本次为中断结束（{stop_reason()}）：数据已按「在线口径」落盘，")
+        print("   但片长不完整，计数准确率不可与完整片段直接比较。")
 
     if finalize_delta > 0:
         print("")
@@ -394,7 +481,7 @@ def main() -> int:
         "offline_acc_pct": round(acc_offline, 1) if acc_offline is not None else "",
         "first_event_frame": events[0]["frame"] if events else "",
         "last_event_frame": events[-1]["frame"] if events else "",
-        "notes": args.notes,
+        "notes": compose_notes(args.notes),
     }
     summary_path = results_dir / "online_count_results.csv"
     exists = summary_path.exists()
@@ -419,4 +506,9 @@ def _device_name() -> str:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        # 只可能发生在倒计时 / 预热阶段（测量循环已自行捕获），此时还没有可保存的数据
+        print("\n[取消] 在测量开始前中断，未产生任何数据。")
+        raise SystemExit(130)
